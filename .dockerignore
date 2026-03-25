@@ -1,0 +1,22 @@
+# Git
+.git/
+.gitignore
+.gitmodules
+
+# Egg / build artifacts
+lib.egg-info/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Outputs (generated at runtime, can be large)
+data_outputs/
+
+# Data (mount via -v instead of baking into the image)
+data_inputs/
+
+# Docs extras not needed at runtime
+docs/
