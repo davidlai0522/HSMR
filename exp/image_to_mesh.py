@@ -54,62 +54,14 @@ def extract_bone_scaling(pipeline, pd_params):
     }
 
 # ================== Command Line Supports ==================
-def load_img_inputs(args, MAX_IMG_W=1920, MAX_IMG_H=1080):
-    IMG_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
-
-    # 1. Inference inputs type.
-    inputs_path = Path(args.input_path)
-    if inputs_path.is_file() and inputs_path.suffix.lower() in IMG_EXTS:
-        inputs_type = 'imgs'
-        single_img = True
-    elif inputs_path.is_file():
-        inputs_type = 'video'
-        single_img = False
-    else:
-        inputs_type = 'imgs'
-        single_img = False
-    get_logger(brief=True).info(f'🚚 Loading inputs from: {inputs_path}, regarded as <{inputs_type}>.')
-
-    # 2. Load inputs.
-    inputs_meta = {'type': inputs_type}
-    if inputs_type == 'video':
-        inputs_meta['seq_name'] = inputs_path.stem
-        frames, _ = load_video(inputs_path)
-        if frames.shape[1] > MAX_IMG_H:
-            frames = flex_resize_video(frames, (MAX_IMG_H, -1), kp_mod=4)
-        if frames.shape[2] > MAX_IMG_W:
-            frames = flex_resize_video(frames, (-1, MAX_IMG_W), kp_mod=4)
-        raw_imgs = [frame for frame in frames]
-    elif inputs_type == 'imgs':
-        if single_img:
-            img_fns = [inputs_path]
-            inputs_meta['seq_name'] = inputs_path.stem
-        else:
-            img_fns = list(inputs_path.glob('*.*'))
-            img_fns = [fn for fn in img_fns if fn.suffix.lower() in IMG_EXTS]
-            inputs_meta['seq_name'] = f'{inputs_path.stem}-img_cnt={len(img_fns)}'
-        raw_imgs = []
-        for fn in img_fns:
-            img, _ = load_img(fn)
-            if img.shape[0] > MAX_IMG_H:
-                img = flex_resize_img(img, (MAX_IMG_H, -1), kp_mod=4)
-            if img.shape[1] > MAX_IMG_W:
-                img = flex_resize_img(img, (-1, MAX_IMG_W), kp_mod=4)
-            raw_imgs.append(img)
-        inputs_meta['img_fns'] = img_fns
-    else:
-        raise ValueError(f'Unsupported inputs type: {inputs_type}.')
-    get_logger(brief=True).info(f'📦 Totally {len(raw_imgs)} images are loaded.')
-
-    return raw_imgs, inputs_meta
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    # parser.add_argument('-t', '--input_type', type=str, default='auto', help='Specify the input type. auto: file~video, folder~imgs', choices=['auto', 'video', 'imgs'])
+    parser.add_argument('-t', '--input_type', type=str, default='auto', help='Specify the input type. auto: file~video, folder~imgs', choices=['auto', 'video', 'imgs'])
     parser.add_argument('-i', '--input_path', type=str, required=True, help='The input images root or video file path.')
     parser.add_argument('-o', '--output_path', type=str, default=PM.outputs/'demos', help='The output root.')
     parser.add_argument('-m', '--model_root', type=str, default=DEFAULT_HSMR_ROOT, help='The model root which contains `.hydra/config.yaml`.')
-    parser.add_argument('-d', '--device', type=str, default='cpu', help='The device.')
+    parser.add_argument('-d', '--device', type=str, default='cuda:0', help='The device.')
     parser.add_argument('--det_bs', type=int, default=10, help='The max batch size for detector.')
     parser.add_argument('--det_mis', type=int, default=512, help='The max image size for detector.')
     parser.add_argument('--rec_bs', type=int, default=300, help='The batch size for recovery.')
@@ -117,7 +69,7 @@ def parse_args():
     parser.add_argument('--ignore_skel', action='store_true', help='Do not render skeleton to boost the rendering.')
     parser.add_argument('--have_caption', action='store_true', help='Add caption to the rendered images.')
     parser.add_argument('--save_mesh', action='store_true', help='Save skeleton and skin meshes as OBJ files.')
-    parser.add_argument('--save_json', action='store_true', default=True, help='Save SKEL data as JSON files.')
+    parser.add_argument('--save_json', action='store_true', help='Save SKEL data as JSON files.')
     parser.add_argument('--save_viz', action='store_true', help='Save visualization images/videos like run_demo.')
     parser.add_argument('--mesh_scale', type=float, nargs=3, default=[1.0, 1.0, 1.0], metavar=('X', 'Y', 'Z'),
                         help='Manual scaling factors for mesh output [scale_x, scale_y, scale_z]. Default: 1.0 1.0 1.0')
@@ -136,7 +88,7 @@ def main():
 
     with monitor('Data Preprocessing'):
         with monitor('Load Inputs'):
-            raw_imgs, inputs_meta = load_img_inputs(args)
+            raw_imgs, inputs_meta = load_inputs(args)
 
         with monitor('Detector Initialization'):
             get_logger(brief=True).info('🧱 Building detector.')
@@ -156,8 +108,6 @@ def main():
             get_logger(brief=True).error(f'🚫 No human instance detected. Please ensure the validity of your inputs!')
         get_logger(brief=True).info(f'🔍 Totally {len(patches)} human instances are detected.')
 
-    # Input should be image only (as this script is designed to run on cpu)
-    inputs_meta['type'] == 'imgs'
 
     # ⛩️ 2. Human skeleton and mesh recovery.
     with monitor('Pipeline Initialization'):
@@ -205,6 +155,19 @@ def main():
         get_logger(brief=True).info(f'📏 Extracting bone scaling data...')
         bone_data = extract_bone_scaling(pipeline, pd_params)
         get_logger(brief=True).info(f'✅ Bone scaling extracted.')
+
+        # Compute T-pose skin mesh: same betas, zero poses (identity rotation).
+        # This rest-pose mesh is needed by downstream stages (Float-Tetwild,
+        # skinning generator, flexcomp generator).
+        get_logger(brief=True).info(f'🧍 Computing T-pose skin mesh...')
+        pd_params_tpose = {k: v.clone() for k, v in pd_params.items()}
+        pd_params_tpose['poses'] = torch.zeros_like(pd_params['poses'])
+        m_skin_tpose, _ = prepare_mesh(pipeline, pd_params_tpose)
+        if args.mesh_scale != [1.0, 1.0, 1.0]:
+            scale_factors = torch.tensor(args.mesh_scale, dtype=m_skin_tpose['v'].dtype,
+                                         device=m_skin_tpose['v'].device)
+            m_skin_tpose['v'] = m_skin_tpose['v'] * scale_factors
+        get_logger(brief=True).info(f'✅ T-pose mesh computed.')
 
     # ⛩️ 3. Visualization (optional)
     if args.save_viz:
@@ -257,7 +220,7 @@ def main():
                     instance_idx = cur_patch_j + j
                     
                     # Determine filenames
-                    if inputs_meta['type'] == 'imgs':
+                    if inputs_meta['type'] in ('imgs', 'img'):
                         img_name = inputs_meta['img_fns'][i].stem
                         json_filename = outputs_root / f'{pipeline.name}-{img_name}_instance_{j}.json'
                         mesh_prefix = outputs_root / f'{pipeline.name}-{img_name}_instance_{j}'
@@ -327,7 +290,16 @@ def main():
                         skin_mesh_filename = f'{mesh_prefix}_skin.obj'
                         skin_mesh.export(skin_mesh_filename, file_type='obj')
                         saved_files.append(f'{mesh_prefix.name}_skin.obj')
-                    
+
+                        # Save T-pose skin mesh (zero pose, same betas)
+                        tpose_mesh = trimesh.Trimesh(
+                            vertices=m_skin_tpose['v'][instance_idx].numpy(),
+                            faces=m_skin_tpose['f'].cpu().numpy(),
+                        )
+                        tpose_filename = f'{mesh_prefix}_tpose_skin.obj'
+                        tpose_mesh.export(tpose_filename, file_type='obj')
+                        saved_files.append(f'{mesh_prefix.name}_tpose_skin.obj')
+
                     if saved_files:
                         get_logger(brief=True).info(f'💾 Saved: {", ".join(saved_files)}')
                 
@@ -367,8 +339,7 @@ def main():
                 
                 get_logger(brief=True).info(f'📊 Saved summary: {summary_filename.name}')
             
-            get_logger(brief=True).info('🎊 All SKEL data saved to')
-            get_logger(brief=True).info(f"\033[92m{outputs_root}\033[0m")
+            get_logger(brief=True).info(f'🎊 All SKEL data saved to {outputs_root}')
     else:
         get_logger(brief=True).info(f'⏭️ Skipping data export (use --save_json and/or --save_mesh to enable)')
     

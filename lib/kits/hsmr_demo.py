@@ -39,16 +39,31 @@ def parse_args():
 
 # ================== Data Process Tools ==================
 
+IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
+
 def load_inputs(args, MAX_IMG_W=1920, MAX_IMG_H=1080):
     # 1. Inference inputs type.
     inputs_path = Path(args.input_path)
-    if args.input_type != 'auto': inputs_type = args.input_type
-    else: inputs_type = 'video' if Path(args.input_path).is_file() else 'imgs'
+    if args.input_type != 'auto':
+        inputs_type = args.input_type
+    elif inputs_path.is_file():
+        inputs_type = 'img' if inputs_path.suffix.lower() in IMAGE_EXTS else 'video'
+    else:
+        inputs_type = 'imgs'
     get_logger(brief=True).info(f'🚚 Loading inputs from: {inputs_path}, regarded as <{inputs_type}>.')
 
     # 2. Load inputs.
     inputs_meta = {'type': inputs_type}
-    if inputs_type == 'video':
+    if inputs_type == 'img':
+        inputs_meta['seq_name'] = inputs_path.stem
+        inputs_meta['img_fns'] = [inputs_path]
+        img, _ = load_img(inputs_path)
+        if img.shape[0] > MAX_IMG_H:
+            img = flex_resize_img(img, (MAX_IMG_H, -1), kp_mod=4)
+        if img.shape[1] > MAX_IMG_W:
+            img = flex_resize_img(img, (-1, MAX_IMG_W), kp_mod=4)
+        raw_imgs = [img]
+    elif inputs_type == 'video':
         inputs_meta['seq_name'] = inputs_path.stem
         frames, _ = load_video(inputs_path)
         if frames.shape[1] > MAX_IMG_H:
